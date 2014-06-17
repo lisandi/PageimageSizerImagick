@@ -1,0 +1,1165 @@
+<?php
+
+/**
+ * ProcessWire module for replacing image manipulation with iMagick
+ *
+ *
+ * ProcessWire 2.x
+ * Copyright (C) 2010 by Ryan Cramer
+ * Licensed under GNU/GPL v2, see LICENSE.TXT
+ *
+ * http://www.processwire.com
+ * http://www.ryancramer.com
+ *
+**/
+
+/*******************************************************************************
+  *  $Source: /WEB/pw4/htdocs/site/modules/PageimageSizerImagick/PageimageSizerImagick.module,v $
+  *  $Id: PageimageSizerImagick.module,v 1.1.2.1 2014/06/17 16:42:57 horst Exp $
+  ******************************************************************************
+**/
+
+/**
+*   TO-DO:
+*
+*       add 'useNormalize' to Configpage and embedd code for it into resize function
+*
+*       add 'canWeUseCMS' to Configpage and a test that should be run once by the user manually,
+*       maybe automatically on install?
+*
+*       use different resize / cropping functions depending on if image dimensions
+*       are need to be increased or decreased by a small or large amount.
+*       (Thumbnails and interpolation / upscaling)
+*
+*/
+
+
+class PageimageSizerImagick extends WireData implements Module, ConfigurableModule {
+
+    /**
+     * getModuleInfo is a module required by all modules to tell ProcessWire about them
+     *
+     * @return array
+     *
+     */
+    public static function getModuleInfo() {
+        return array(
+            'title'    => 'Pageimage Sizer Imagick',
+            'version'  => 31,
+            'summary'  => 'A module for replacing GD resizing with Imagick',
+            'href'     => 'https://processwire.com/talk/topic/5889-image-quality-problem-on-resize/',
+            'singular' => true,
+            'autoload' => true
+            );
+    }
+
+
+    protected $image = array(
+        'width' => 0,
+        'height' => 0
+        );
+    protected $origFilename;
+    protected $origWidth;
+    protected $origHeight;
+    protected $extension;
+    protected $destFilename;
+    protected $destWidth;
+    protected $destHeight;
+    protected $autoRotation;
+    protected $sharpening;
+    protected $upscaling;
+    protected $cropping;
+    protected $quality;
+    protected $modified;
+    #protected $iptcRaw;
+
+    private $im;
+    private $hasICC;
+    private $hasIPTC;
+    private $hasEXIF;
+    private $hasXMP;
+    private $imageType;
+    private $imageFormat;
+    private $imageColorspace;
+    private $imageRenderingIntent;
+    private $imageDepth;
+    private $imageGamma;
+    private $imageCompression;
+    private $imageMetadata;
+    private $useGray;
+
+
+    /**
+    * To use icc conversion we need support of lcms lib in ImageMagick,
+    * but it is not possible to test if it is supported.
+    *
+    * We will implement a test in the ConfigPage that a user should execute and answer.
+    *
+    * The result is kept in this var.
+    *
+    * Afterwards on runtime, we have to do other tests, e.g. if the Imagick version we
+    * are running on is able to read gamma settings from images.
+    *
+    * If we detect that one of them is not available, we disable the use of ICC-conversion
+    * via this var.
+    */
+    private $canWeUseCMS = false;
+
+    /**
+    * This can be set in the ConfigPage,
+    * or passed with $options array along with the pageimage functions witdht(), height(), size()
+    */
+    private $useCMS;
+
+    /**
+    * This is detected on runtime. It reflects if all needed profiles are available or not.
+    */
+    private $useICC;
+
+    /**
+    * holds needed icc profiles, will be loaded on demand
+    */
+    private $iccWorkspace;
+    private $iccRgbIn;
+    private $iccGrayIn;
+    private $iccCmykIn;
+    private $iccRgbOut;
+    private $iccGrayOut;
+
+
+    static public function validSourceImageFormats() {
+        return array(
+            'PNG', 'PNG8', 'PNG24',
+            'JPG', 'JPEG',
+            'GIF', 'GIF87'
+            );
+    }
+
+
+    static public function validTargetImageFormats() {
+        return self::validSourceImageFormats();
+    }
+
+
+    /**
+     * Default settings used by this module
+     *
+     * @return array
+     */
+    static public function getDefaultData() {
+        return array(
+            'canWeUseCMS' => 1,
+            'useCMS' => 0,
+            'keepICC' => 0,
+            'keepEXIF' => 0,
+            'keepXMP' => 0,
+            'gdFallback' => 1,
+            'rgbInProfile' => 'sRGB_Color_Space_Profile.icc',
+            'rgbOutProfile' => 'sRGB_Color_Space_Profile.icc',
+            'grayInProfile' => 'grayGamma22.icc',
+            'grayOutProfile' => 'grayGamma22.icc',
+            'workspaceProfile' => 'AdobeRGB1998.icc',
+            'cmykInProfile' => 'USWebCoatedSWOP.icc'
+            );
+    }
+
+
+    /**
+     * Populate default settings
+     *
+     */
+    public function __construct() {
+        foreach(self::getDefaultData() as $key => $value) {
+            $this->$key = $value;
+        }
+    }
+
+
+    /**
+     * Initialize the module and setup hooks
+     *
+     */
+    public function init() {
+        $this->pages->addHookBefore('ImageSizer::resize', $this, 'resize');
+    }
+
+
+    public function __destruct() {
+        $this->release();
+    }
+
+
+    protected function release() {
+        if(!is_object($this->im)) return;
+        $this->im->clear();
+        $this->im->destroy();
+    }
+
+
+    /**
+     * Build a form allowing configuration of this Module
+     *
+     */
+    static public function getModuleConfigInputfields(array $data) {
+        $data = array_merge(self::getDefaultData(), $data);
+        require_once(dirname(__FILE__) . '/PageimageSizerImagickConfig.php');
+        $c = new PageimageSizerImagickConfig();
+        return $c->getConfig($data);
+    }
+
+
+    /**
+     * take over the ImageSizer Object and start with Image Inspection and Manipulation
+     *
+     */
+    public function resize($event) {
+
+        // REMOVE | ONLY FOR THE TESTCASE-SITE AND DEVELOPMENT >>>
+        if(isset($GLOBALS['SKIP_IMAGICK_RESIZER']) && true===$GLOBALS['SKIP_IMAGICK_RESIZER']) {
+            $event->replace = false;
+            return;
+        }
+        // <<< ONLY FOR THE TESTCASE-SITE AND DEVELOPMENT | REMOVE
+
+
+        if(!class_exists('Imagick')) {
+            if(2 == intval($this->gdFallback)) {
+                // raise Error
+                throw new WireException(__("ERROR: The Imagick-class isn't available!"));
+            }
+            // silent Fallback to GD-lib
+            $event->replace = false;
+            return;
+        }
+
+        // check if we have got individual settings for this image
+        $options = array();
+        $validOptions = array('useGD', 'useCMS', 'useNormalize', 'keepICC', 'keepEXIF', 'keepXMP');
+        foreach($validOptions as $option) {
+            if(null!==$event->object->$option) {
+                $options[$option] = $event->object->$option;
+            }
+        }
+        if(is_array($options) && 0<count($options)) {
+            foreach($options as $k=>$v) {
+                switch($k) {
+                    case 'useGD':
+                        if($this->getBooleanValue($v)) {
+                            // fallback to ImageSizer with GD-lib
+                            $event->replace = false;
+                            return;
+                        }
+                        break;
+                    default:
+                        // override settings from Configpage with individual ones
+                        $this->$k = $this->data[$k] = $this->getBooleanValue($v);
+                        break;
+                }
+            }
+        }
+
+        // read all options and settings from the ImageSizer-Object
+        $this->destWidth = $targetWidth = $event->arguments[0];
+        $this->destHeight = $targetHeight = $event->arguments[1];
+        $this->origWidth = $event->object->image['width'];
+        $this->origHeight = $event->object->image['height'];
+        $this->image = $event->object->image;
+        $this->extension = $event->object->extension;
+        $this->destFilename = $event->object->filename;
+        $this->origFilename = str_replace('.'.$targetWidth.'x'.$targetHeight, '', $this->destFilename);
+        $this->autoRotation = $event->object->autoRotation;
+        $this->sharpening = $event->object->sharpening;
+        $this->upscaling = $event->object->upscaling;
+        $this->cropping = $event->object->cropping;
+        $this->quality = $event->object->quality;
+        $this->modified = $event->object->modified;
+
+        // set flag that we replace the core resize method
+        $event->replace = true;
+
+        // check if we need to rotate the image and / or if we need to resize it
+        $orientations = null;
+        $needRotation = $this->autoRotation !== true ? false : ($this->checkOrientation($orientations) && (!empty($orientations[0]) || !empty($orientations[1])) ? true : false);
+        $needResizing = $this->isResizeNecessary($targetWidth, $targetHeight);
+
+        // start image magick
+        $this->im = new Imagick();
+
+        // should we use the ICC-CMS ?
+        #$this->canWeUseCMS = $this->data['canWeUseCMS'] ? true : false;
+        $this->useCMS = isset($this->data['useCMS']) && $this->data['useCMS'] ? true : false;
+
+        // set the working colorspace: COLORSPACE_RGB or COLORSPACE_SRGB    ( whats about COLORSPACE_GRAY ??)
+        $this->workspaceColorspace = $this->useCMS ? Imagick::COLORSPACE_RGB : Imagick::COLORSPACE_SRGB;
+        $this->im->setColorspace($this->workspaceColorspace);
+
+        // load the image
+        if(!$this->im->readImage($this->destFilename)) {  // actually we get a filecopy from origFilename to destFilename from PageImage
+            $this->release();
+            if(2 == intval($this->gdFallback) && ($needResizing || $needRotation)) {
+                // raise Error
+                $event->return = false;
+                throw new WireException(sprintf(__("Imagick cannot load imagefile: %s", basename($this->destFilename))));
+                return false;
+            }
+            // silent Fallback to GD-lib
+            $event->replace = false;
+            return;
+        }
+
+        // check validity against image magick
+        if(!$this->im->valid()) {
+            throw new WireException(sprintf(__("loaded file '%s' is not a valid image", basename($this->destFilename))));
+            $event->return = false;
+            return false;
+        }
+
+        // get image format
+        $this->imageFormat = $this->im->getImageFormat();
+
+        // check validity against PW
+        if(!in_array($this->imageFormat, $this->validSourceImageFormats())) {
+            throw new WireException(sprintf(__("loaded file '%s' is not in the list of valid images", basename($this->destFilename))));
+            $event->return = false;
+            return false;
+        }
+
+        // check and retrieve different image parts and information: ICC, Colorspace, Colordepth, Metadata, etc
+        $this->imageColorspace = $this->im->getImageColorspace();
+        $this->workspaceColorspace = IMAGICK::COLORSPACE_GRAY == $this->imageColorspace ? IMAGICK::COLORSPACE_GRAY : $this->workspaceColorspace;
+        $this->im->setColorspace($this->workspaceColorspace);
+        $this->imageMetadata = $this->im->getImageProfiles('*');
+        if(!is_array($this->imageMetadata)) $this->imageMetadata = array();
+        $this->hasICC = array_key_exists('icc', $this->imageMetadata);
+        $this->hasIPTC = array_key_exists('iptc', $this->imageMetadata);
+        $this->hasEXIF = array_key_exists('exif', $this->imageMetadata);
+        $this->hasXMP = array_key_exists('xmp', $this->imageMetadata);
+        $this->imageType = $this->im->getImageType();
+        $this->imageDepth = $this->im->getImageDepth();
+        $this->imageGamma = $this->im->getImageGamma();
+        if(0 == $this->imageGamma) {
+            // we seem to running on a Imagick version that lacks some features,
+            // at least the 'getImageGamma()', therefor we asume a Gamma of 2.2 here
+            $this->imageGamma = 0.454545;
+        }
+
+        // remove not wanted / needed Metadata
+        foreach(array_keys($this->imageMetadata) as $k) {
+            if('icc'==$k) continue;  // we keep embedded icc profiles
+            if('iptc'==$k) continue;  // we keep embedded iptc data
+            if('exif'==$k && $this->data['keepEXIF']) continue; // we have to keep exif data too
+            if('xmp'==$k && $this->data['keepXMP']) continue; // we have to keep xmp data too
+            $this->im->profileImage("$k", null); // remove this one
+        }
+
+        if($needRotation || $needResizing) {
+
+            $this->im->setImageDepth(16);
+
+            if($this->canWeUseCMS && $this->useCMS) {
+                $this->useCMS = $this->iccCmsStart();
+            }
+
+            $resetGamma = false;
+            if($this->imageGamma && $this->imageGamma!=1) {
+                $resetGamma = $this->im->gammaImage($this->imageGamma);
+            }
+
+            // is autoRotation needed ?
+            if($needRotation) {
+                $degree = (is_float($orientations[0]) || is_int($orientations[0])) && $orientations[0] > -361 && $orientations[0] < 361 ? $orientations[0] : false;
+                if($degree !== false && !in_array($degree, array(-360, 0, 360))) {
+                    if(!$this->im->rotateImage(new ImagickPixel('#00000000'), $degree)) {
+                        $this->release();
+                        $event->return = false;
+                        return false;
+                    }
+                    $this->modified = true;
+                    if($degree == 90 || $degree == 270) {
+                        // we have to swap width & height now!
+                        $tmp = array($this->origWidth, $this->origHeight);
+                        $this->origWidth = $tmp[1];
+                        $this->origHeight = $tmp[0];
+                    }
+                }
+                if($orientations[1] == 2) {
+                    if(!$this->im->flipImage()) {
+                        $this->release();
+                        $event->return = false;
+                        return false;
+                    }
+                    $this->modified = true;
+                }
+                if($orientations[1] == 1) {
+                    if(!$this->im->flopImage()) {
+                        $this->release();
+                        $event->return = false;
+                        return false;
+                    }
+                    $this->modified = true;
+                }
+            }
+
+            // here we check for cropping, upscaling, sharpening
+            // we get all dimensions at first, before any image operation !
+            list($gdWidth, $gdHeight, $targetWidth, $targetHeight) = $this->getResizeDimensions($targetWidth, $targetHeight);
+            $x1 = ($gdWidth / 2) - ($targetWidth / 2);
+            $y1 = ($gdHeight / 2) - ($targetHeight / 2);
+            $this->getCropDimensionsIR($x1, $y1, $gdWidth, $targetWidth, $gdHeight, $targetHeight);
+
+            // now lets check what operations are necessary:
+            if($gdWidth==$targetWidth && $gdWidth==$this->image['width'] && $gdHeight==$this->image['height'] && $gdHeight==$targetHeight) {
+
+                // this is the case if the original size is requested or a greater size but upscaling is set to false
+                // we need to do nothing here
+
+                $this->sharpening = 'none';  // no need for sharpening because we use original copy without scaling
+                $this->modified = true;
+
+            }
+            elseif($gdWidth==$targetWidth && $gdHeight==$targetHeight) {
+
+                // this is the case if we scale up or down without cropping
+                // we need to resize
+
+                if(!$this->im->resizeImage($targetWidth, $targetHeight, imagick::FILTER_LANCZOS, 1)) {
+                    $this->release();
+                    $event->return = false;
+                    return false;
+                }
+                $this->modified = true;
+
+                //                // optional use this for thumbnails
+                //                if(!$this->im->thumbnailImage($targetWidth, $targetHeight)) {
+                //                    $this->release();
+                //                    $event->return = false;
+                //                    return false;
+                //                }
+
+            }
+            else {
+
+                // we use two steps: scale up or down and also crop the image
+
+                if(!$this->im->resizeImage($gdWidth, $gdHeight, imagick::FILTER_LANCZOS, 1)) {
+                    $this->release();
+                    $event->return = false;
+                    return false;
+                }
+                if(!$this->im->cropImage($targetWidth, $targetHeight, $x1, $y1)) {
+                    $this->release();
+                    $event->return = false;
+                    return false;
+                }
+                $this->im->setImagePage(0, 0, 0, 0);  //remove the canvas
+
+                $this->modified = true;
+
+                //                if(ImagickInfo::functionExists('cropthumbnailimage') && (is_bool($this->cropping) || 'c'==$this->cropping || 'center'==$this->cropping)) {
+                //
+                //                    //crop and resize the image
+                //                    if(!$this->im->cropThumbnailImage($targetWidth, $targetHeight)) {
+                //                        $this->release();
+                //                        $event->return = false;
+                //                        return false;
+                //                    }
+                //                    $this->im->setImagePage(0, 0, 0, 0);  //remove the canvas
+                //                }
+
+            }
+
+            if($this->sharpening && $this->sharpening != 'none') {
+                $this->imSharpen($this->sharpening);
+            }
+
+            if(isset($resetGamma) && $this->imageGamma && $this->imageGamma!=1) {
+                $this->im->gammaImage(1/$this->imageGamma);
+            }
+
+            if($this->canWeUseCMS && $this->useCMS) {
+                $this->iccCmsFinish();
+            }
+
+            $this->im->setImageDepth(($this->imageDepth > 8 ? 8 : $this->imageDepth));
+
+        }
+
+// REMOVE | ONLY WHILE TESTING SERVERS AND VERSIONS >>>
+if($this->useCMS && $this->useICC) $GLOBALS['useCMS'] = true;
+// <<< ONLY WHILE TESTING SERVERS AND VERSIONS | REMOVE
+
+        // should we strip ICC-Profiles?
+        if(!$this->data['keepICC'] || ($this->useCMS && (!$this->canWeUseCMS))) {
+            $this->im->setImageProfile('icc', null);
+            // TODO 4 -c untested: check if icc-profile is stripped!
+        }
+
+        // prepare to save file
+        $this->im->setImageFormat($this->imageFormat);
+        $this->im->setImageType($this->imageType);
+        if(in_array(strtoupper($this->imageFormat), array('JPG', 'JPEG'))) {
+            $this->im->setImageCompression(IMAGICK::COMPRESSION_JPEG);
+            $this->im->setImageCompressionQuality($this->quality);
+        }
+        elseif(in_array(strtoupper($this->imageFormat), array('PNG', 'PNG8', 'PNG24'))) {
+            $this->im->setImageCompression(IMAGICK::COMPRESSION_ZIP);
+            $this->im->setImageCompressionQuality($this->quality);
+        }
+        else {
+            $this->im->setImageCompression(IMAGICK::COMPRESSION_UNDEFINED);
+            $this->im->setImageCompressionQuality($this->quality);
+        }
+
+        // save to file
+        @unlink($this->destFilename);
+        @clearstatcache(dirname($this->destFilename));
+        #if(!$this->im->writeImage($this->destFilename)) {
+        // We use this approach for saving so that it behaves the same like core ImageSizer with images that
+        // have a wrong extension in their filename. When using writeImage() it automatically corrects the
+        // mimetype to match the fileextension, <- we want to avoid this!
+        if(! file_put_contents($this->destFilename, $this->im)) {
+            $this->release();
+            $event->return = false;
+            return false;
+        }
+
+        // release and return to event-object
+        $this->release();
+        $event->object->setModified($this->modified);
+        $event->return = true;
+        return true;
+    }
+
+
+    protected function iccCmsStart() {
+        if(!$this->useCMS || !$this->canWeUseCMS) {
+            return false;
+        }
+
+        // check if we have an ICC Workspaceprofile and a RGB-Targetprofile
+        $tmpName = dirname(__FILE__) . '/icc/targetprofiles/' . $this->data['rgbOutProfile'];
+        if(is_file($tmpName) && 'icc'==strtolower(pathinfo($tmpName, PATHINFO_EXTENSION))) {
+            $this->iccRgbOut = file_get_contents($tmpName);
+        }
+        $this->useICC = isset($this->iccRgbOut) ? true : false;
+        $tmpName = dirname(__FILE__) . '/icc/workspaceprofiles/' . $this->data['workspaceProfile'];
+        if($this->useICC && is_file($tmpName) && 'icc'==strtolower(pathinfo($tmpName, PATHINFO_EXTENSION))) {
+            $this->iccWorkspace = file_get_contents($tmpName);
+        }
+        else {
+            $this->useICC = false;
+        }
+        unset($tmpName);
+        $this->useGray = false;
+
+
+        if($this->useICC && $this->hasICC) {
+            if(IMAGICK::COLORSPACE_GRAY == $this->imageColorspace) {
+                $tmpName = dirname(__FILE__) . '/icc/grayscaleprofiles/' . $this->data['grayOutProfile'];
+                if(is_file($tmpName) && 'icc'==strtolower(pathinfo($tmpName, PATHINFO_EXTENSION))) {
+                    $this->iccGrayOut = file_get_contents($tmpName);
+                }
+                unset($tmpName);
+                $this->useGray = isset($this->iccGrayOut) ? true : false;
+            }
+            $this->im->profileImage('icc', $this->imageMetadata['icc']);  // assign the individual profile
+            $this->im->profileImage('icc', $this->iccWorkspace);
+            return true;
+        }
+        elseif($this->useICC && !$this->hasICC) {
+            if(in_array($this->imageColorspace, array(IMAGICK::COLORSPACE_SRGB, IMAGICK::COLORSPACE_RGB))) {
+                $tmpName = dirname(__FILE__) . '/icc/targetprofiles/' . $this->data['rgbInProfile'];
+                if(is_file($tmpName) && 'icc'==strtolower(pathinfo($tmpName, PATHINFO_EXTENSION))) {
+                    $this->iccRgbIn = file_get_contents($tmpName);
+                }
+                if(!isset($this->iccRgbIn)) {
+                    $tmpName = dirname(__FILE__) . '/icc/workspaceprofiles/' . $this->data['rgbInProfile'];
+                    if(is_file($tmpName) && 'icc'==strtolower(pathinfo($tmpName, PATHINFO_EXTENSION))) {
+                        $this->iccRgbIn = file_get_contents($tmpName);
+                    }
+                }
+                if(isset($this->iccRgbIn)) {
+                    $this->im->profileImage('icc', $this->iccRgbIn);  // assign the RGB default profile
+                    $this->im->profileImage('icc', $this->iccWorkspace);
+                    return true;
+                }
+            }
+            elseif(IMAGICK::COLORSPACE_CMYK == $this->imageColorspace) {
+                $tmpName = dirname(__FILE__) . '/icc/cmykprofiles/' . $this->data['cmykInProfile'];
+                if(is_file($tmpName) && 'icc'==strtolower(pathinfo($tmpName, PATHINFO_EXTENSION))) {
+                    $this->iccCmykIn = file_get_contents($tmpName);
+                    $this->im->profileImage('icc', $this->iccCmykIn);  // assign the default cmyk profile
+                    $this->im->profileImage('icc', $this->iccWorkspace);
+                    return true;
+                }
+            }
+            elseif(IMAGICK::COLORSPACE_GRAY == $this->imageColorspace) {
+                $tmpName = dirname(__FILE__) . '/icc/grayscaleprofiles/' . $this->data['grayOutProfile'];
+                if(is_file($tmpName) && 'icc'==strtolower(pathinfo($tmpName, PATHINFO_EXTENSION))) {
+                    $this->iccGrayOut = file_get_contents($tmpName);
+                }
+                $this->useGray = isset($this->iccGrayOut) ? true : false;
+                $tmpName = dirname(__FILE__) . '/icc/grayscaleprofiles/' . $this->data['grayInProfile'];
+                if($this->useGray && is_file($tmpName) && 'icc'==strtolower(pathinfo($tmpName, PATHINFO_EXTENSION))) {
+                    $this->iccGrayIn = file_get_contents($tmpName);
+                    $this->im->profileImage('icc', $this->iccGrayIn);  // assign the default grayscale profile
+                    $this->im->profileImage('icc', $this->iccWorkspace);
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+
+    protected function iccCmsFinish() {
+        if(!$this->useCMS || !$this->canWeUseCMS) return false;
+        if(!$this->useICC) return false;
+        // transition into Targetcolorspace
+        if($this->useGray) {
+            $this->im->profileImage('icc', $this->iccGrayOut);
+        }
+        else {
+            $this->im->profileImage('icc', $this->iccRgbOut);
+        }
+    }
+
+
+    protected function colorspaceName($cs) {
+        switch(intval($cs)) {
+            case 1:
+                return 'RGB';
+            case 2:
+                return 'GRAY';
+            case 3:
+                return 'transparent';
+            case 4:
+                return 'OHTA';
+            case 5:
+                return 'LAB';
+            case 6:
+                return 'XYZ';
+            case 7:
+                return 'YCbCr';
+            case 8:
+                return 'YCC';
+            case 9:
+                return 'YIQ';
+            case 10:
+                return 'YPbPr';
+            case 11:
+                return 'YUV';
+            case 12:
+                return 'CMYK';
+            case 13:
+                return 'sRGB';
+            case 14:
+                return 'HSB';
+            case 15:
+                return 'HSL';
+            case 16:
+                return 'HWB';
+            case 0:
+            default:
+                return 'undefined';
+        }
+    }
+
+
+    protected function renderingIntentName($ri) {
+        switch(intval($ri)) {
+            case 1:
+                return 'saturation';
+            case 2:
+                return 'perceptual';
+            case 3:
+                return 'absolute';
+            case 4:
+                return 'relative';
+            case 0:
+            default:
+                return 'undefined';
+        }
+    }
+
+
+    protected function imageTypeName($type) {
+        switch(intval($type)) {
+            case imagick::IMGTYPE_BILEVEL:
+                return 'bilevel';
+            case imagick::IMGTYPE_GRAYSCALE:
+                return 'grayscale';
+            case imagick::IMGTYPE_GRAYSCALEMATTE:
+                return 'grayscalematte';
+            case imagick::IMGTYPE_PALETTE:
+                return 'palette';
+            case imagick::IMGTYPE_PALETTEMATTE:
+                return 'palettematte';
+            case imagick::IMGTYPE_TRUECOLOR:
+                return 'truecolor';
+            case imagick::IMGTYPE_TRUECOLORMATTE:
+                return 'truecolormatte';
+            case imagick::IMGTYPE_COLORSEPARATION:
+                return 'colorseparation';
+            case imagick::IMGTYPE_COLORSEPARATIONMATTE:
+                return 'colorseparationmatte';
+            case imagick::IMGTYPE_OPTIMIZE:
+                return 'optimize';
+            case imagick::IMGTYPE_UNDEFINED:
+            default:
+                return 'undefined';
+        }
+    }
+
+
+    /**
+     * Check orientation (@horst)
+     *
+     * @param array
+     * @return bool
+     *
+     */
+    protected function checkOrientation(&$correctionArray) {
+        // first value is rotation-degree and second value is flip-mode: 0=NONE | 1=HORIZONTAL | 2=VERTICAL
+        $corrections = array(
+            '1' => array(  0, 0),
+            '2' => array(  0, 1),
+            '3' => array(180, 0),
+            '4' => array(  0, 2),
+            '5' => array(270, 1),
+            '6' => array(270, 0),
+            '7' => array( 90, 1),
+            '8' => array( 90, 0)
+            );
+        if(!function_exists('exif_read_data')) return false;
+        $exif = @exif_read_data($this->filename, 'IFD0');
+        if(!is_array($exif) || !isset($exif['Orientation']) || !in_array(strval($exif['Orientation']), array_keys($corrections))) return false;
+        $correctionArray = $corrections[strval($exif['Orientation'])];
+        return true;
+    }
+
+
+    /**
+     * Given a value, convert it to a boolean.
+     *
+     * Value can be string representations like: 0, 1 off, on, yes, no, y, n, false, true.
+     *
+     * @param bool|int|string $value
+     * @return bool
+     *
+     */
+    protected function getBooleanValue($value) {
+        if(is_bool($value)) return $value;
+        if(is_integer($value)) return $value > 0;
+        if(in_array(strtolower($value), array('0', 'off', 'false', 'no', 'n', 'none'))) return false;
+        if(in_array(strtolower($value), array('1', 'on', 'true', 'yes', 'y'))) return true;
+        return false;
+    }
+
+
+    /**
+     * Sharpen image (@horst)
+     *
+     * @param string $mode May be: none | soft | medium | strong
+     * @return void
+     *
+     */
+    protected function imSharpen($mode) {
+
+        switch($mode) {
+
+            case 'none':
+                return true;
+                break;
+
+            case 'strong':
+                $m = array(0, 0.5, 1, 0.05);
+                break;
+
+            case 'medium':
+                $m = array(0, 0.5, 0.7, 0.1);
+                break;
+
+            case 'soft':
+            default:
+                $m = array(0, 0.5, 0.5, 0.2);
+                break;
+        }
+
+        $this->im->unsharpMaskImage($m[0], $m[1], $m[2], $m[3]);
+        $this->modified = true;
+        return true;
+    }
+
+
+    /**
+     * check if cropping is needed, if yes, populate x- and y-position to params $w1 and $h1
+     *
+     * Intended for use by the resize() method
+     *
+     * @param int $w1 - byReference
+     * @param int $h1 - byReference
+     * @param int $gdWidth
+     * @param int $targetWidth
+     * @param int $gdHeight
+     * @param int $targetHeight
+     * @return void
+     *
+     */
+    protected function getCropDimensionsIR(&$w1, &$h1, $gdWidth, $targetWidth, $gdHeight, $targetHeight) {
+
+        if(is_string($this->cropping)) {
+            switch($this->cropping) {
+                case 'nw':
+                    $w1 = 0;
+                    $h1 = 0;
+                    break;
+                case 'n':
+                    $h1 = 0;
+                    break;
+                case 'ne':
+                    $w1 = $gdWidth - $targetWidth;
+                    $h1 = 0;
+                    break;
+                case 'w':
+                    $w1 = 0;
+                    break;
+                case 'e':
+                    $w1 = $gdWidth - $targetWidth;
+                    break;
+                case 'sw':
+                    $w1 = 0;
+                    $h1 = $gdHeight - $targetHeight;
+                    break;
+                case 's':
+                    $h1 = $gdHeight - $targetHeight;
+                    break;
+                case 'se':
+                    $w1 = $gdWidth - $targetWidth;
+                    $h1 = $gdHeight - $targetHeight;
+                    break;
+                default: // center or false, we do nothing
+            }
+        }
+        elseif(is_array($this->cropping)) {
+            // @interrobang + @u-nikos
+            if(strpos($this->cropping[0], '%') === false) $pointX = (int) $this->cropping[0];
+                else $pointX = $gdWidth * ((int) $this->cropping[0] / 100);
+
+            if(strpos($this->cropping[1], '%') === false) $pointY = (int) $this->cropping[1];
+                else $pointY = $gdHeight * ((int) $this->cropping[1] / 100);
+
+            if($pointX < $targetWidth / 2) $w1 = 0;
+                else if($pointX > ($gdWidth - $targetWidth / 2)) $w1 = $gdWidth - $targetWidth;
+                else $w1 = $pointX - $targetWidth / 2;
+
+            if($pointY < $targetHeight / 2) $h1 = 0;
+                else if($pointY > ($gdHeight - $targetHeight / 2)) $h1 = $gdHeight - $targetHeight;
+                else $h1 = $pointY - $targetHeight / 2;
+        }
+
+    }
+
+
+    /**
+     * Given a target height, return the proportional width for this image
+     *
+     */
+    protected function getProportionalWidth($targetHeight) {
+        $img =& $this->image;
+        return ceil(($targetHeight / $img['height']) * $img['width']);
+    }
+
+
+    /**
+     * Given a target width, return the proportional height for this image
+     *
+     */
+    protected function getProportionalHeight($targetWidth) {
+        $img =& $this->image;
+        return ceil(($targetWidth / $img['width']) * $img['height']);
+    }
+
+
+    /**
+     * Get an array of the 4 dimensions necessary to perform the resize
+     *
+     * Note: Some code used in this method is adapted from code found in comments at php.net for the GD functions
+     *
+     * Intended for use by the resize() method
+     *
+     * @param int $targetWidth
+     * @param int $targetHeight
+     * @return array
+     *
+     */
+    protected function getResizeDimensions($targetWidth, $targetHeight) {
+
+        $pWidth = $targetWidth;
+        $pHeight = $targetHeight;
+
+        $img =& $this->image;
+
+        if(!$targetHeight) $targetHeight = round(($targetWidth / $img['width']) * $img['height']);
+        if(!$targetWidth) $targetWidth = round(($targetHeight / $img['height']) * $img['width']);
+
+        $originalTargetWidth = $targetWidth;
+        $originalTargetHeight = $targetHeight;
+
+        if($img['width'] < $img['height']) {
+            $pHeight = $this->getProportionalHeight($targetWidth);
+        } else {
+            $pWidth = $this->getProportionalWidth($targetHeight);
+        }
+
+        if($pWidth < $targetWidth) {
+            // if the proportional width is smaller than specified target width
+            $pWidth = $targetWidth;
+            $pHeight = $this->getProportionalHeight($targetWidth);
+        }
+
+        if($pHeight < $targetHeight) {
+            // if the proportional height is smaller than specified target height
+            $pHeight = $targetHeight;
+            $pWidth = $this->getProportionalWidth($targetHeight);
+        }
+
+        if(!$this->upscaling) {
+            // we are going to shoot for something smaller than the target
+
+            while($pWidth > $img['width'] || $pHeight > $img['height']) {
+                // favor the smallest dimension
+                if($pWidth > $img['width']) {
+                    $pWidth = $img['width'];
+                    $pHeight = $this->getProportionalHeight($pWidth);
+                }
+
+                if($pHeight > $img['height']) {
+                    $pHeight = $img['height'];
+                    $pWidth = $this->getProportionalWidth($pHeight);
+                }
+
+                if($targetWidth > $pWidth) $targetWidth = $pWidth;
+                if($targetHeight > $pHeight) $targetHeight = $pHeight;
+
+                if(!$this->cropping) {
+                    $targetWidth = $pWidth;
+                    $targetHeight = $pHeight;
+                }
+            }
+        }
+
+        if(!$this->cropping) {
+            // we will make the image smaller so that none of it gets cropped
+            // this means we'll be adjusting either the targetWidth or targetHeight
+            // till we have a suitable dimension
+
+            if($pHeight > $originalTargetHeight) {
+                $pHeight = $originalTargetHeight;
+                $pWidth = $this->getProportionalWidth($pHeight);
+                $targetWidth = $pWidth;
+                $targetHeight = $pHeight;
+            }
+            if($pWidth > $originalTargetWidth) {
+                $pWidth = $originalTargetWidth;
+                $pHeight = $this->getProportionalHeight($pWidth);
+                $targetWidth = $pWidth;
+                $targetHeight = $pHeight;
+            }
+        }
+
+        $r = array(
+            0 => (int) $pWidth,
+            1 => (int) $pHeight,
+            2 => (int) $targetWidth,
+            3 => (int) $targetHeight
+            );
+
+        return $r;
+    }
+
+
+    /**
+     * Return true if it's necessary to perform a resize with the given width/height, or false if not.
+     *
+     * @param int $targetWidth
+     * @param int $targetHeight
+     * @return bool
+     *
+     */
+    protected function isResizeNecessary($targetWidth, $targetHeight) {
+        $img =& $this->image;
+        $resize = true;
+
+        if((!$targetWidth || $img['width'] == $targetWidth) &&
+            (!$targetHeight || $img['height'] == $targetHeight)) {
+            $resize = false;
+        }
+        elseif(!$this->upscaling && ($targetHeight >= $img['height'] && $targetWidth >= $img['width'])) {
+            $resize = false;
+        }
+        return $resize;
+    }
+
+
+    /**
+     * Given an unknown cropping value, return the validated internal representation of it
+     *
+     * @param string|bool|array $cropping
+     * @return string|bool
+     *
+     */
+    static public function croppingValue($cropping) {
+        return ImageSizer::croppingValue($cropping);
+    }
+
+
+    /**
+     * Given an unknown cropping value, return the string representation of it
+     *
+     * Okay for use in filenames
+     *
+     * @param string|bool|array $cropping
+     * @return string
+     *
+     */
+    static public function croppingValueStr($cropping) {
+        return ImageSizer::croppingValueStr($cropping);
+    }
+
+}
+
+
+
+
+if(!class_exists('ImagickInfo')) {
+    class ImagickInfo {
+
+        /**
+         * returns if Imagick PHP extension is available or not
+         *
+         * If param fullsupport is true (the default), it take into account if all needed functions are available too.
+         * If param fullsupport is false, it simply returns if the Imagick extension is installed or not.
+         *
+         * @return boolean
+         */
+        static public function hasImagick($fullsupport=true) {
+            if(!class_exists('Imagick')) return false;
+            if(!$fullsupport) return true;
+            $a = self::compareNeededMethods();
+            return count($a) == 0 ? true : false;
+        }
+
+        /**
+         * returns the ImageMagick Version
+         *
+         * @return mixed: array, string
+         */
+        static public function getImageMagickVersion($fullString=false) {
+            if(!self::hasImagick(false)) return $fullString ? 'Not available' : '0.0.0';
+            $im = new Imagick();
+            $a = $im->getVersion();
+            $im->clear(); $im->destroy(); $im = null;
+            preg_match('/ImageMagick ([0-9]+\.[0-9]+\.[0-9]+)/', $a['versionString'], $match);
+            return $fullString ? $a['versionString'] : $match[1];
+        }
+
+        /**
+         * Returns Information about ImageMagick and Imagick module
+         *
+         * @return mixed: array, string
+         */
+        static public function getImageMagickInfos() {
+            if(self::isDisabled('phpinfo')) {
+                return array();
+            }
+            ob_start();
+            phpinfo();
+            $buffer = ob_get_clean();
+            $pattern = '/>imagick<.*?<table.*?(<tr>.*?<\/table>)/msi';
+            preg_match($pattern, $buffer, $matches);
+            if(!isset($matches[1])) {
+                return false;
+            }
+            $buf = trim(str_replace('</table>', '', $matches[1]));
+            $a = explode("\n", strip_tags(str_replace(array("\r\n", "\r", '</td><td'), array("\n", "\n", '</td>###<td'), $buf)));
+            $info = array();
+            foreach($a as $line) {
+                if(preg_match('/ImageMagick supported formats/i', $line)) continue;
+                $tmp = explode('###', $line);
+                $info[trim($tmp[0], ': ')] = str_replace(' http://www.imagemagick.org', '', trim($tmp[1]));
+            }
+            return $info;
+        }
+
+        /**
+        * compares needed functions by PageimageSizerImagick against an installed Imagick version
+        */
+        static public function compareNeededMethods($neededMethods=null) {
+            if(!class_exists('Imagick')) return false;
+            if(!is_array($neededMethods)) {
+                $neededMethods = array(
+                    'valid',
+                    'clear',
+                    'destroy',
+                    'setcolorspace',
+
+                    'readimage',
+                    'writeimage',
+
+                    'rotateimage',
+                    'flipimage',
+                    'flopimage',
+
+                    'resizeimage',
+                    'cropimage',
+
+                    'unsharpmaskimage',
+
+                    'gammaimage',
+                    'profileimage',
+
+                    'getimagecolorspace',
+                    'getimagedepth',
+                    'getimageformat',
+                    'getimagegamma',
+                    'getimageprofiles',
+                    'getimagetype',
+
+                    'setimagecompression',
+                    'setimagecompressionquality',
+                    'setimagedepth',
+                    'setimageformat',
+                    'setimagepage',
+                    'setimageprofile',
+                    'setimagetype'
+                    );
+            }
+            return array_diff($neededMethods, get_class_methods('Imagick'));
+        }
+
+        /**
+        * returns if a function exists in Imagick extension or not
+        *
+        * @param string $functionName
+        * @return boolean
+        */
+        static public function functionExists($functionName) {
+            $functionName = is_string($functionName) ? strtolower($functionName) : 'hasSentWrongParam';
+            return array_diff(array("$functionName"), get_class_methods('Imagick')) ? false : true;
+        }
+
+        /**
+         * returns if function is disabled in php
+         *
+         * @return boolean: true, false
+         */
+        static protected function isDisabled($function) {
+            $disabled_functions = explode(',' , str_replace(' ', '', strtolower(ini_get('disable_functions'))));
+            return in_array(strtolower($function), $disabled_functions);
+        }
+
+    }
+
+} // end if class exists ImagickInfo
